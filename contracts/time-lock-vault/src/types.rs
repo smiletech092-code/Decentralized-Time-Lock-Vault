@@ -24,8 +24,12 @@ pub enum VaultKey {
     PendingAdmin,
     /// Set to true once initialize() has been called; never removed
     Initialized,
-    /// Global list of all active depositor addresses (Vec<Address>)
-    DepositorList,
+    /// Total count of active depositors
+    DepositorCount,
+    /// Maps slot index → depositor address (for O(1) swap-remove)
+    DepositorAt(u32),
+    /// Maps depositor address → slot index (for O(1) lookup during removal)
+    DepositorIndex(Address),
     /// Address that receives penalty fees on early cancellation
     FeeRecipient,
     /// Runtime-configurable max deposit amount (overrides compile-time constant).

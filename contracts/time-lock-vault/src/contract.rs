@@ -21,6 +21,7 @@ impl TimeLockVault {
     pub fn initialize(
         env: Env,
         admin: Address,
+        fee_recipient: Option<Address>,
         max_deposit: Option<i128>,
         max_lock_secs: Option<u64>,
     ) -> Result<(), VaultError> {
@@ -32,6 +33,9 @@ impl TimeLockVault {
         storage::set_admin(&env, &admin);
         storage::set_initialized(&env);
 
+        if let Some(r) = fee_recipient {
+            storage::set_fee_recipient(&env, &r);
+        }
         if let Some(v) = max_deposit {
             if v <= 0 {
                 return Err(VaultError::InvalidAmount);
@@ -316,7 +320,8 @@ impl TimeLockVault {
     }
 
     pub fn get_depositors(env: Env, offset: u32, limit: u32) -> Vec<Address> {
-        storage::get_depositors_page(&env, offset, limit)
+        const MAX_PAGE_SIZE: u32 = 100;
+        storage::get_depositors_page(&env, offset, limit.min(MAX_PAGE_SIZE))
     }
 
     // ----------------------------------------------------------------

@@ -35,7 +35,7 @@ fn setup() -> (Env, TimeLockVaultClient<'static>, Address, Address, Address, Add
 
     StellarAssetClient::new(&env, &token_address).mint(&alice, &10_000);
 
-    vault.initialize(&admin, &None, &None);
+    vault.initialize(&admin, &Some(fee_recipient.clone()), &None, &None);
 
     (env, vault, token_address, admin, alice, fee_recipient)
 }
@@ -57,7 +57,7 @@ fn setup_with_limits(
     let token_address = token_id.address();
 
     StellarAssetClient::new(&env, &token_address).mint(&alice, &1_000_000);
-    vault.initialize(&admin, &max_deposit, &max_lock_secs);
+    vault.initialize(&admin, &None, &max_deposit, &max_lock_secs);
 
     (env, vault, token_address, admin, alice)
 }
@@ -88,7 +88,7 @@ fn test_initialize_sets_admin() {
 #[test]
 fn test_double_initialize_fails() {
     let (_env, vault, _token, admin, _alice, _fee) = setup();
-    assert_eq!(vault.try_initialize(&admin, &None, &None), Err(Ok(VaultError::Unauthorized)));
+    assert_eq!(vault.try_initialize(&admin, &None, &None, &None), Err(Ok(VaultError::Unauthorized)));
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn test_is_initialized() {
     let vault = TimeLockVaultClient::new(&env, &vault_id);
     let admin: Address = Address::generate(&env);
     assert!(!vault.is_initialized());
-    vault.initialize(&admin, &None, &None);
+    vault.initialize(&admin, &None, &None, &None);
     assert!(vault.is_initialized());
 }
 
@@ -276,18 +276,16 @@ fn test_cancel_deposit_zero_penalty_returns_full_amount() {
 
 #[test]
 fn test_cancel_deposit_partial_penalty_splits_correctly() {
-    let (env, vault, token, admin, alice, _fee) = setup();
-    let fee_recipient: Address = Address::generate(&env);
-    // Re-initialize with fee_recipient by using storage directly isn't possible;
-    // instead we verify the penalty goes somewhere by checking alice's balance.
+    let (env, vault, token, _admin, alice, fee_recipient) = setup();
     let token_client = TokenClient::new(&env, &token);
     let unlock_time = env.ledger().timestamp() + 3600;
-    // 10% penalty (1000 bps), no fee_recipient set → penalty goes to depositor fallback
+    // 10% penalty (1000 bps), fee_recipient set in setup
     vault.deposit(&alice, &token, &1_000, &unlock_time, &1_000);
     vault.cancel_deposit(&alice);
     assert!(vault.get_vault(&alice).is_none());
-    // refund = 900, penalty = 100 (goes to fee_recipient fallback = alice since none set)
-    assert_eq!(token_client.balance(&alice), 10_000);
+    // refund = 900, penalty = 100 → goes to fee_recipient
+    assert_eq!(token_client.balance(&alice), 9_900);
+    assert_eq!(token_client.balance(&fee_recipient), 100);
 }
 
 #[test]
@@ -615,7 +613,7 @@ fn test_initialize_invalid_max_deposit_fails() {
     let vault_id = env.register(TimeLockVault, ());
     let vault = TimeLockVaultClient::new(&env, &vault_id);
     let admin: Address = Address::generate(&env);
-    assert_eq!(vault.try_initialize(&admin, &Some(0_i128), &None), Err(Ok(VaultError::InvalidAmount)));
+    assert_eq!(vault.try_initialize(&admin, &None, &Some(0_i128), &None), Err(Ok(VaultError::InvalidAmount)));
 }
 
 #[test]
@@ -625,12 +623,102 @@ fn test_initialize_invalid_max_lock_secs_fails() {
     let vault_id = env.register(TimeLockVault, ());
     let vault = TimeLockVaultClient::new(&env, &vault_id);
     let admin: Address = Address::generate(&env);
-    assert_eq!(vault.try_initialize(&admin, &None, &Some(0_u64)), Err(Ok(VaultError::LockDurationTooLong)));
+    assert_eq!(vault.try_initialize(&admin, &None, &None, &Some(0_u64)), Err(Ok(VaultError::LockDurationTooLong)));
 }
 
 // ================================================================
-//  TTL / storage constants
+//  Depositor index — boundary & performance
 // ================================================================
+
+#[test]
+fn test_get_depositors_limit_capped_at_100() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+    StellarAssetClient::new(&env, &token).mint(&alice, &1_000_000);
+    let unlock_time = env.ledger().timestamp() + 3600;
+    // Deposit once; requesting limit > 100 should still work without panic
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &0);
+    let page = vault.get_depositors(&0, &u32::MAX);
+    assert_eq!(page.len(), 1);
+}
+
+#[test]
+fn test_get_depositors_limit_zero_returns_empty() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+    let unlock_time = env.ledger().timestamp() + 3600;
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &0);
+    assert_eq!(vault.get_depositors(&0, &0).len(), 0);
+}
+
+#[test]
+fn test_remove_depositor_swap_removes_correctly() {
+    // Deposit three users, withdraw the first; verify the list is consistent.
+    let (env, vault, token, _admin, alice, _fee) = setup();
+    let bob: Address = Address::generate(&env);
+    let carol: Address = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bob, &5_000);
+    StellarAssetClient::new(&env, &token).mint(&carol, &5_000);
+    let unlock_time = env.ledger().timestamp() + 3600;
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &0);
+    vault.deposit(&bob, &token, &2_000, &unlock_time, &0);
+    vault.deposit(&carol, &token, &3_000, &unlock_time, &0);
+
+    // Emergency-withdraw alice (slot 0) — carol (slot 2) should swap into slot 0
+    let admin = vault.get_admin().unwrap();
+    vault.emergency_withdraw(&admin, &alice);
+
+    assert_eq!(vault.get_depositor_count(), 2);
+    let all = vault.get_depositors(&0, &10);
+    assert_eq!(all.len(), 2);
+    // Neither alice should appear
+    for addr in all.iter() {
+        assert_ne!(addr, alice);
+    }
+}
+
+#[test]
+fn test_depositor_removed_on_cancel_deposit() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+    let unlock_time = env.ledger().timestamp() + 3600;
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &0);
+    assert_eq!(vault.get_depositor_count(), 1);
+    vault.cancel_deposit(&alice);
+    assert_eq!(vault.get_depositor_count(), 0);
+}
+
+// ================================================================
+//  fee_recipient via initialize
+// ================================================================
+
+#[test]
+fn test_initialize_sets_fee_recipient() {
+    let (env, vault, _token, _admin, _alice, fee_recipient) = setup();
+    assert_eq!(vault.get_fee_recipient(), Some(fee_recipient));
+    let _ = env;
+}
+
+#[test]
+fn test_cancel_deposit_penalty_sent_to_fee_recipient() {
+    let (env, vault, token, _admin, alice, fee_recipient) = setup();
+    let token_client = TokenClient::new(&env, &token);
+    let unlock_time = env.ledger().timestamp() + 3600;
+    // 10% penalty
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &1_000);
+    vault.cancel_deposit(&alice);
+    // alice gets 900 back; fee_recipient gets 100
+    assert_eq!(token_client.balance(&alice), 9_900);
+    assert_eq!(token_client.balance(&fee_recipient), 100);
+}
+
+#[test]
+fn test_initialize_without_fee_recipient_stores_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let vault_id = env.register(TimeLockVault, ());
+    let vault = TimeLockVaultClient::new(&env, &vault_id);
+    let admin: Address = Address::generate(&env);
+    vault.initialize(&admin, &None, &None, &None);
+    assert_eq!(vault.get_fee_recipient(), None);
+}
 
 #[test]
 fn test_bump_target_covers_max_lock_duration() {
